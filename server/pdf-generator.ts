@@ -19,9 +19,20 @@ const COLORS = {
   gold: "#B7950B",          // citation highlight
 };
 
+export interface OrgInfo {
+  name: string;
+  address: string;
+  npi: string;
+  logoUrl?: string;
+  signingPhysician: string;
+  signingTitle: string;
+  outboundFax: string;
+}
+
 export async function generateAppealPDF(
   sections: AppealSections,
-  appealId: string
+  appealId: string,
+  _orgInfo?: OrgInfo
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const filePath = path.join(UPLOAD_DIR, `appeal-${appealId}.pdf`);

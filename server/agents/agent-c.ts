@@ -1,18 +1,13 @@
 /**
  * Agent C — Appeal Generation + Delivery Agent
- * Responsibilities:
- *   1. Take denial, patient, ground truth from Agent B
- *   2. Use Cohere (command-a-03-2025) to generate all 7 appeal sections
- *   3. Render 7-page PDF appeal packet via PDFKit
- *   4. Queue fax delivery to payer medical director
- *   5. Store appeal packet + fax log and return appealId
  */
 
 import { storage } from "../storage";
 import { agentLogger } from "./logger";
 import { runStore } from "./run-store";
 import { generateAppealWithCohere } from "../cohere-engine";
-import { generateAppealPDF } from "../pdf-generator";
+import { generateAppealPDF, OrgInfo } from "../pdf-generator";
+import { DEMO_ORG_ID, PAYER_FAX_NUMBERS } from "../seed";
 import type { DenialRecord, PatientProfile, GroundTruth } from "@shared/schema";
 
 function nanoid(len = 8) {
@@ -28,6 +23,7 @@ export interface AgentCInput {
   appealStrength: number;
   legalTags: string[];
   strategy: string;
+  orgId?: string;
 }
 
 export interface AgentCOutput {
@@ -47,14 +43,12 @@ export interface AgentCOutput {
 
 export async function runAgentC(input: AgentCInput): Promise<AgentCOutput> {
   const { runId, denial, patient, groundTruth } = input;
+  const orgId = input.orgId || DEMO_ORG_ID;
   const LOG = (msg: string, data?: Record<string, unknown>) =>
     agentLogger.step(runId, "Agent-C", msg, data);
 
   runStore.updateRun(runId, { phase: "agent-c" });
-  runStore.updateAgentPhase(runId, "agentC", {
-    status: "running",
-    startedAt: new Date().toISOString(),
-  });
+  runStore.updateAgentPhase(runId, "agentC", { status: "running", startedAt: new Date().toISOString() });
 
   LOG("▶ Agent C — Appeal Generation & Delivery Agent starting");
   LOG("Step 1/5: Generating appeal sections with Cohere command-a-03-2025");
@@ -68,11 +62,9 @@ export async function runAgentC(input: AgentCInput): Promise<AgentCOutput> {
       sections: Object.keys(appealSections).filter(k => k !== "coverPageData" && k !== "attachmentsList").length,
     });
   } catch (err: unknown) {
-    agentLogger.warn(runId, "Agent-C", `Cohere generation failed — using fallback: ${(err as Error).message}`);
     throw new Error(`Appeal generation failed: ${(err as Error).message}`);
   }
 
-  // Word count summary
   const sectionsSummary = {
     executiveSummary: appealSections.executiveSummary?.split(/\s+/).length || 0,
     clinicalBackground: appealSections.clinicalBackground?.split(/\s+/).length || 0,
@@ -86,12 +78,23 @@ export async function runAgentC(input: AgentCInput): Promise<AgentCOutput> {
 
   LOG("Step 2/5: Rendering 7-page PDF appeal packet");
 
-  // Step 2: Generate PDF
+  // Step 2: Fetch org for PDF
+  const org = storage.getOrganization(orgId);
+  const orgInfo = {
+    name: org?.name || "MD Anderson Cancer Center (Demo)",
+    address: `${org?.address || "1515 Holcombe Blvd"}, ${org?.city || "Houston"}, ${org?.state || "TX"} ${org?.zip || "77030"}`,
+    npi: org?.npi || "1234567890",
+    logoUrl: org?.logoUrl || undefined,
+    signingPhysician: org?.signingPhysician || "Dr. Sarah Miller",
+    signingTitle: org?.signingTitle || "Attending Oncologist",
+    outboundFax: org?.outboundFax || "+1-713-792-0000",
+  };
+
   const appealId = `AP-${new Date().getFullYear()}-${nanoid()}`;
   let pdfPath = "";
 
   try {
-    pdfPath = await generateAppealPDF(appealSections, appealId);
+    pdfPath = await generateAppealPDF(appealSections, appealId, orgInfo);
     LOG(`PDF generated → ${pdfPath}`);
   } catch (err: unknown) {
     agentLogger.error(runId, "Agent-C", `PDF generation failed: ${(err as Error).message}`);
@@ -100,17 +103,17 @@ export async function runAgentC(input: AgentCInput): Promise<AgentCOutput> {
 
   LOG("Step 3/5: Storing appeal packet in database");
 
-  // Step 3: Resolve NCCN + drug for citations
   const nccn = storage.getAllNccn().find(n => n.nccnId === groundTruth.nccnId);
   const drug = storage.getDrug(groundTruth.drugId);
 
   const appeal = storage.insertAppeal({
+    organizationId: orgId,
     appealId,
     denialRecordId: denial.denialRecordId,
     patientId: patient.patientId,
     groundTruthRowId: groundTruth.groundTruthRowId,
     payerId: denial.payerId,
-    payerFaxNumber: denial.payerFaxNumber || "",
+    payerFaxNumber: denial.payerFaxNumber || PAYER_FAX_NUMBERS[denial.payerId] || "",
     status: "generated",
     appealType: "first_level",
     nccnCitation: `${nccn?.guidelineVersion || "NCCN Guidelines"} — ${nccn?.pageReference || ""} (Category ${groundTruth.nccnCategory})`,
@@ -126,14 +129,13 @@ export async function runAgentC(input: AgentCInput): Promise<AgentCOutput> {
   });
   LOG(`Appeal record created: ${appeal.appealId}`);
 
-  // Update denial status
   storage.updateDenialStatus(denial.denialRecordId, "appeal_generated", groundTruth.groundTruthRowId);
 
   LOG("Step 4/5: Queuing fax delivery to payer Medical Director");
 
-  // Step 4: Queue fax
-  const faxNumber = denial.payerFaxNumber || "+1-866-252-0566";
+  const faxNumber = denial.payerFaxNumber || PAYER_FAX_NUMBERS[denial.payerId] || "+1-866-252-0566";
   const faxLog = storage.insertFaxLog({
+    organizationId: orgId,
     appealId: appeal.appealId,
     payerId: denial.payerId,
     faxNumber,
@@ -141,59 +143,30 @@ export async function runAgentC(input: AgentCInput): Promise<AgentCOutput> {
     status: "queued",
     costCents: 49,
     pageCount: 7,
-    attemptNumber: 1,
     sentAt: new Date().toISOString(),
-    deliveredAt: null,
-    errorMessage: null,
-    metadata: JSON.stringify({ runId, agentPipeline: true }),
   });
 
-  LOG(`Fax queued to ${denial.payerName} Medical Director: ${faxNumber}`, {
-    faxLogId: faxLog.id,
-    pageCount: 7,
-  });
+  LOG(`Fax queued to ${denial.payerName} Medical Director: ${faxNumber}`, { faxLogId: faxLog.id, pageCount: 7 });
 
-  // Simulate fax transmission (production: integrate real fax API)
   setTimeout(async () => {
     try {
-      storage.updateFaxLog(faxLog.id, {
-        status: "delivered",
-        attemptNumber: 1,
-        deliveredAt: new Date().toISOString(),
-        jobId: `FAX-${nanoid(6)}`,
-      });
+      storage.updateFaxLog(faxLog.id, { status: "delivered", deliveredAt: new Date().toISOString() });
       storage.updateAppeal(appeal.appealId, {
-        status: "faxed",
-        faxStatus: "delivered",
-        faxSentAt: new Date().toISOString(),
-        faxDeliveredAt: new Date().toISOString(),
+        status: "faxed", faxStatus: "delivered",
+        faxSentAt: new Date().toISOString(), faxDeliveredAt: new Date().toISOString(),
       });
       agentLogger.success(runId, "Agent-C", `✓ Fax delivered to ${denial.payerName}: ${faxNumber}`);
-    } catch {
-      // Fax delivery failure logged separately
-    }
+    } catch { /* silent */ }
   }, 3000 + Math.random() * 2000);
 
   LOG("Step 5/5: Pipeline complete — appeal packet ready");
 
-  runStore.updateAgentPhase(runId, "agentC", {
-    status: "completed",
-    completedAt: new Date().toISOString(),
-  });
+  runStore.updateAgentPhase(runId, "agentC", { status: "completed", completedAt: new Date().toISOString() });
   runStore.addAgentStep(runId, "agentC", `Appeal ${appealId} generated, ${totalWords} words, fax queued to ${faxNumber}`);
   runStore.updateRun(runId, { appealId });
 
-  agentLogger.success(
-    runId,
-    "Agent-C",
-    `✓ Appeal generation complete: ${appealId} — ${totalWords} words, 7-page PDF, fax queued to ${denial.payerName}`
-  );
+  agentLogger.success(runId, "Agent-C",
+    `✓ Appeal generation complete: ${appealId} — ${totalWords} words, 7-page PDF, fax queued to ${denial.payerName}`);
 
-  return {
-    appealId: appeal.appealId,
-    pdfPath,
-    faxLogId: faxLog.id,
-    faxNumber,
-    sectionsSummary,
-  };
+  return { appealId: appeal.appealId, pdfPath, faxLogId: faxLog.id, faxNumber, sectionsSummary };
 }

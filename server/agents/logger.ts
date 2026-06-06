@@ -68,6 +68,14 @@ class AgentLogger extends EventEmitter {
     return this.logs.get(runId) ?? [];
   }
 
+  getAllLogs(): LogEntry[] {
+    const all: LogEntry[] = [];
+    for (const entries of this.logs.values()) {
+      all.push(...entries);
+    }
+    return all.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  }
+
   clearLogs(runId: string) {
     this.logs.delete(runId);
   }

@@ -171,7 +171,7 @@ export async function runFDAIngestAgent(runId: string): Promise<{ inserted: numb
         seenIds.add(drug.id);
         const existing = storage.getDrug(drug.id);
         if (!existing) {
-          storage.upsertDrug({ ...drug, createdAt: new Date().toISOString() });
+          storage.upsertDrug({ ...drug });
           inserted++;
         } else {
           skipped++;

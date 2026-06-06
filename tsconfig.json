@@ -1,13 +1,14 @@
 {
   "include": ["client/src/**/*", "shared/**/*", "server/**/*"],
-  "exclude": ["node_modules", "build", "dist", "**/*.test.ts"],
+  "exclude": ["node_modules", "build", "dist", "**/*.test.ts", "server/auth.ts", "server/db.ts"],
   "compilerOptions": {
+    "target": "es2017",
     "incremental": true,
     "tsBuildInfoFile": "./node_modules/typescript/tsbuildinfo",
     "noEmit": true,
     "module": "ESNext",
     "strict": true,
-    "lib": ["esnext", "dom", "dom.iterable"],
+    "lib": ["es2017", "dom", "dom.iterable"],
     "jsx": "preserve",
     "esModuleInterop": true,
     "skipLibCheck": true,

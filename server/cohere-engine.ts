@@ -1,6 +1,6 @@
 import { CohereClient } from "cohere-ai";
 import { storage } from "./storage";
-import { DenialRecord, PatientProfile, GroundTruth } from "@shared/schema";
+import { DenialRecord, PatientProfile, GroundTruth, AppealPacket } from "@shared/schema";
 
 const cohere = new CohereClient({ token: "lfWaRwjaOdTuZEOlP2uLFyFMTWcDfM0EtLLQZl7Q" });
 
@@ -15,6 +15,18 @@ export const BAD_FAITH_STATUTES: Record<string, string> = {
   IL: "Illinois Insurance Code 215 ILCS 5/155 (bad faith claims handling) and IL Compiled Statutes § 356z.3 (step therapy exemptions for cancer patients)",
   MA: "Massachusetts General Laws Chapter 176O § 13 (utilization review — written decisions citing clinical criteria) and MGL Chapter 93A (consumer protection for unfair trade practices)",
   DEFAULT: "applicable state insurance bad-faith statutes and ERISA § 502(a)(1)(B) (29 U.S.C. § 1132) providing right to recover wrongfully denied plan benefits",
+};
+
+// ─── BIOMARKER TRIAL CITATIONS ────────────────────────────────────────────────
+const BIOMARKER_CITATIONS: Record<string, string> = {
+  "EGFR": "FLAURA trial (NEJM 2018): osimertinib demonstrated superior OS (38.6 vs 31.8 months) vs first-generation EGFR TKIs in EGFR-mutant NSCLC.",
+  "HER2_low": "DESTINY-Breast04 trial (NEJM 2022): trastuzumab deruxtecan demonstrated superior PFS (9.9 vs 5.1 months) and OS in HER2-low metastatic breast cancer.",
+  "ALK": "ALEX trial (NEJM 2017): alectinib demonstrated superior PFS (34.8 vs 10.9 months) vs crizotinib in ALK-positive NSCLC.",
+  "IDH1": "INDIGO trial (NEJM 2023): vorasidenib demonstrated 61% reduction in risk of progression in IDH-mutant grade 2 glioma.",
+  "IDH2": "INDIGO trial (NEJM 2023): vorasidenib demonstrated 61% reduction in risk of progression in IDH-mutant grade 2 glioma.",
+  "PDL1": "KEYNOTE-024 trial (NEJM 2016): pembrolizumab demonstrated superior PFS (10.3 vs 6.0 months) vs chemotherapy in PD-L1 >=50% NSCLC.",
+  "TNBC": "ASCENT trial (NEJM 2021): sacituzumab govitecan demonstrated superior OS (12.1 vs 6.7 months) vs chemotherapy in metastatic TNBC.",
+  "MGMT": "Stupp protocol (NEJM 2005): temozolomide with radiotherapy demonstrated superior OS in newly diagnosed GBM, with MGMT methylation as predictive biomarker.",
 };
 
 // ─── APPEAL SECTIONS TYPES ────────────────────────────────────────────────────
@@ -40,7 +52,6 @@ export interface AppealSections {
 
 // ─── MATCH DENIAL TO GROUND TRUTH ─────────────────────────────────────────────
 export async function matchDenialToGroundTruth(denial: DenialRecord, patient: PatientProfile): Promise<GroundTruth | null> {
-  // First try exact match
   const gtRows = storage.getAllGroundTruth();
   const candidates = gtRows.filter(gt =>
     gt.payerId === denial.payerId &&
@@ -49,7 +60,6 @@ export async function matchDenialToGroundTruth(denial: DenialRecord, patient: Pa
   );
 
   if (candidates.length > 0) {
-    // Score by denial reason match too
     const scored = candidates.map(gt => {
       let score = 0;
       if (gt.drugId === denial.drugId) score += 10;
@@ -61,7 +71,6 @@ export async function matchDenialToGroundTruth(denial: DenialRecord, patient: Pa
     return scored[0].gt;
   }
 
-  // Fuzzy fallback — use any GT row matching cancer type + payer
   const fuzzy = gtRows.filter(gt => gt.payerId === denial.payerId || gt.cancerType === patient.cancerType);
   if (fuzzy.length > 0) return fuzzy[0];
 
@@ -82,6 +91,19 @@ export async function generateAppealWithCohere(
   const biomarkers = JSON.parse(patient.biomarkers || "{}");
   const priorTherapies = JSON.parse(patient.priorTherapies || "[]");
   const legalTags = JSON.parse(gt.legalExposureTags || "[]");
+
+  // Biomarker-aware trial citations
+  const biomarkerCitations: string[] = [];
+  for (const [key, value] of Object.entries(biomarkers)) {
+    const citationKey = key.toUpperCase();
+    if (BIOMARKER_CITATIONS[citationKey]) {
+      biomarkerCitations.push(BIOMARKER_CITATIONS[citationKey]);
+    }
+    // Special case: HER2-low
+    if (key === "HER2" && String(value).toLowerCase().includes("low")) {
+      biomarkerCitations.push(BIOMARKER_CITATIONS["HER2_low"]);
+    }
+  }
 
   const conflictTypeLabels: Record<string, string> = {
     A: "NCCN Category 1/2A drug classified as experimental/investigational despite FDA approval and guideline consensus",
@@ -106,6 +128,9 @@ PATIENT PROFILE:
 - Performance Status: ${patient.performanceStatus || "Not specified"}
 - State: ${patient.state}
 
+BIOMARKER-SPECIFIC TRIAL EVIDENCE:
+${biomarkerCitations.length > 0 ? biomarkerCitations.join("\n") : "Standard clinical evidence applies."}
+
 GROUND TRUTH CONFLICT:
 - Conflict Type: ${gt.conflictType} — ${conflictTypeLabels[gt.conflictType] || "Policy-guideline mismatch"}
 - Conflict Description: ${gt.conflictDescription}
@@ -119,12 +144,12 @@ APPLICABLE LAW: ${statute}
 
 Write ONLY valid JSON (no markdown, no prose outside the JSON) with exactly these fields:
 {
-  "executiveSummary": "2-3 paragraph professional summary of the appeal. State the drug, indication, denial reason, NCCN category, FDA status, and that this denial constitutes bad-faith delay of life-saving treatment.",
-  "clinicalBackground": "3-4 paragraph clinical context. Include cancer type, stage, biomarker profile, prior therapies, and why this drug is the appropriate next treatment. Be specific and cite biomarkers.",
-  "nccnFdaSection": "Detailed 3-4 paragraph section citing the exact NCCN guideline version, category, page reference, and full rationale. Include FDA approval details, indication, and supporting trial data.",
-  "payerContradictionSection": "3-4 paragraph section quoting and analyzing the payer policy language. Map each denial reason to the specific conflict with NCCN/FDA. Be direct and adversarial.",
-  "legalFrameworkSection": "2-3 paragraph section citing ERISA Section 502, state bad-faith statutes, and CMS Transparency in Coverage. Include the key sentence about bad-faith denial of life-saving treatment.",
-  "requestedResolution": "1-2 paragraph clear demand for immediate approval and reversal within 72 hours for urgent/expedited or 30 days for standard, with reference to applicable ERISA/plan deadlines."
+  "executiveSummary": "2-3 paragraph professional summary of the appeal.",
+  "clinicalBackground": "3-4 paragraph clinical context including biomarker-specific trial citations.",
+  "nccnFdaSection": "Detailed 3-4 paragraph section citing the exact NCCN guideline version, category, page reference, and full rationale.",
+  "payerContradictionSection": "3-4 paragraph section quoting and analyzing the payer policy language.",
+  "legalFrameworkSection": "2-3 paragraph section citing ERISA Section 502, state bad-faith statutes.",
+  "requestedResolution": "1-2 paragraph clear demand for immediate approval and reversal within 72 hours."
 }`;
 
   let sections: AppealSections;
@@ -138,7 +163,6 @@ Write ONLY valid JSON (no markdown, no prose outside the JSON) with exactly thes
     });
 
     const rawText = response.text?.trim() || "";
-    // Strip markdown code fences if present
     const jsonStr = rawText.replace(/^```json?\n?/, "").replace(/\n?```$/, "").trim();
     const parsed = JSON.parse(jsonStr);
 
@@ -168,8 +192,7 @@ Write ONLY valid JSON (no markdown, no prose outside the JSON) with exactly thes
       ],
     };
   } catch (err) {
-    // Fallback to structured template if Cohere fails
-    sections = generateFallbackAppeal(denial, patient, gt, statute);
+    sections = generateFallbackAppeal(denial, patient, gt, statute, biomarkerCitations);
   }
 
   return sections;
@@ -180,18 +203,25 @@ function generateFallbackAppeal(
   denial: DenialRecord,
   patient: PatientProfile,
   gt: GroundTruth,
-  statute: string
+  statute: string,
+  biomarkerCitations: string[] = []
 ): AppealSections {
   const drug = storage.getDrug(gt.drugId);
   const nccn = Array.from(storage.getAllNccn()).find(n => n.nccnId === gt.nccnId);
+  const biomarkers = JSON.parse(patient.biomarkers || "{}");
+  const priorTherapies = JSON.parse(patient.priorTherapies || "[]");
+
+  const biomarkerText = biomarkerCitations.length > 0
+    ? `\n\nBiomarker-specific evidence:\n${biomarkerCitations.join("\n")}`
+    : "";
 
   return {
     executiveSummary: `This appeal requests immediate reversal of ${denial.payerName}'s denial of ${denial.drugNameRaw} for a patient with ${patient.stage} ${patient.cancerType} cancer. The denial, citing "${denial.denialReasonCode.replace(/_/g, " ")}", directly contradicts ${nccn?.guidelineVersion} Category ${gt.nccnCategory} recommendation and FDA approval for this indication.\n\nThe requested therapy is ${drug?.fdaApprovalStatus === "approved" ? "FDA-approved" : "FDA-accelerated approved"} specifically for this patient population. The conflict has been identified as Type ${gt.conflictType}: ${gt.conflictDescription}.\n\nThis denial constitutes bad-faith delay of life-saving oncology treatment and may violate ${statute}.`,
-    clinicalBackground: `The patient presents with ${patient.stage} ${patient.cancerType} cancer with the following biomarker profile: ${patient.biomarkers}. Prior therapies include: ${patient.priorTherapies}. Current performance status: ${patient.performanceStatus || "adequate for treatment"}.\n\nGiven the documented disease progression and biomarker profile, ${denial.drugNameRaw} represents the evidence-based, guideline-concordant next line of therapy. No alternative therapies in the same class are available that match this patient's molecular profile.\n\nDelaying access to this therapy risks disease progression, metastatic spread, and irreversible harm to this patient's survival outcomes.`,
-    nccnFdaSection: `The ${nccn?.guidelineVersion} — the authoritative oncology treatment standard — designates ${drug?.genericName} as a Category ${gt.nccnCategory} recommendation (${nccn?.recommendationType?.replace(/_/g, " ")}) for this exact indication: ${gt.indication} in patients with biomarker profile ${gt.biomarkerProfile}.\n\n${nccn?.fullCitationText}\n\nFDA approval was granted for ${drug?.fdaLabelSummary} (Reference: ${drug?.fdaLabelReference}). This approval constitutes the highest regulatory standard of evidence for efficacy and safety in this population.\n\nNCC Category 1 indicates uniform consensus based on high-level evidence — there is no credible clinical or scientific basis for the payer's denial classification.`,
-    payerContradictionSection: `${denial.payerName} policy ${gt.policyId} states: "${gt.denialTextSnippet}". This language directly contradicts:\n\n1. FDA-approved indication for ${drug?.brandName} covering this exact patient population.\n2. ${nccn?.guidelineVersion} Category ${gt.nccnCategory} recommendation.\n3. The peer-reviewed clinical evidence base underlying both of the above.\n\nConflict type ${gt.conflictType}: ${gt.conflictDescription}\n\nThis denial appears to be a systematic policy that creates coverage barriers for guideline-concordant oncology care — a pattern that has been identified across multiple plans and geographies. Such systematic barriers may constitute bad-faith insurance practices.`,
-    legalFrameworkSection: `Under ERISA Section 502(a)(1)(B) (29 U.S.C. § 1132), the patient has the right to recover benefits wrongfully denied under the plan. The plan's denial, which contradicts NCCN Category ${gt.nccnCategory} guidelines and FDA regulatory standards, exceeds the plan's lawful authority to define medical necessity contrary to established clinical evidence.\n\nApplicable state law: ${statute}\n\n"This denial contradicts ${nccn?.guidelineVersion}, ${nccn?.pageReference}. Continued denial constitutes bad-faith delay of life-saving oncology treatment and may constitute a violation of ${statute}."`,
-    requestedResolution: `We respectfully demand immediate approval of ${denial.drugNameRaw} for the above-referenced patient and reversal of denial reference ${denial.referenceNumber}. This request should be treated as urgent given the oncologic context.\n\nPer ERISA regulations and applicable state law, a decision must be rendered within 72 hours for urgent/expedited appeals or 30 days for standard appeals. Failure to respond within this timeframe will be treated as a deemed denial and will be escalated to the appropriate state insurance regulatory authority and, if necessary, federal courts.`,
+    clinicalBackground: `The patient presents with ${patient.stage} ${patient.cancerType} cancer with the following biomarker profile: ${JSON.stringify(biomarkers)}. Prior therapies include: ${priorTherapies.map((t: any) => `${t.drug} (response: ${t.response})`).join("; ") || "none"}. Current performance status: ${patient.performanceStatus || "adequate for treatment"}.${biomarkerText}\n\nGiven the documented disease progression and biomarker profile, ${denial.drugNameRaw} represents the evidence-based, guideline-concordant next line of therapy. Delaying access to this therapy risks disease progression and irreversible harm to this patient's survival outcomes.`,
+    nccnFdaSection: `The ${nccn?.guidelineVersion} designates ${drug?.genericName} as a Category ${gt.nccnCategory} recommendation (${nccn?.recommendationType?.replace(/_/g, " ")}) for this exact indication: ${gt.indication}.\n\n${nccn?.fullCitationText}\n\nFDA approval was granted for ${drug?.fdaLabelSummary} (Reference: ${drug?.fdaLabelReference}). NCCN Category 1 indicates uniform consensus based on high-level evidence — there is no credible clinical or scientific basis for the payer's denial classification.`,
+    payerContradictionSection: `${denial.payerName} policy ${gt.policyId} states: "${gt.denialTextSnippet}". This language directly contradicts:\n\n1. FDA-approved indication for ${drug?.brandName} covering this exact patient population.\n2. ${nccn?.guidelineVersion} Category ${gt.nccnCategory} recommendation.\n3. The peer-reviewed clinical evidence base underlying both of the above.\n\nConflict type ${gt.conflictType}: ${gt.conflictDescription}`,
+    legalFrameworkSection: `Under ERISA Section 502(a)(1)(B) (29 U.S.C. § 1132), the patient has the right to recover benefits wrongfully denied under the plan. The plan's denial, which contradicts NCCN Category ${gt.nccnCategory} guidelines and FDA regulatory standards, exceeds the plan's lawful authority to define medical necessity contrary to established clinical evidence.\n\nApplicable state law: ${statute}\n\nContinued denial constitutes bad-faith delay of life-saving oncology treatment.`,
+    requestedResolution: `We respectfully demand immediate approval of ${denial.drugNameRaw} for the above-referenced patient and reversal of denial reference ${denial.referenceNumber}. Per ERISA regulations and applicable state law, a decision must be rendered within 72 hours for urgent/expedited appeals or 30 days for standard appeals.`,
     coverPageData: {
       payerName: denial.payerName,
       medicalDirectorDept: `${denial.payerName} Medical Director — Prior Authorization Appeals`,
@@ -212,7 +242,7 @@ function generateFallbackAppeal(
   };
 }
 
-// ─── EXTRACT DENIAL FROM TEXT (Cohere) ────────────────────────────────────────
+// ─── EXTRACT DENIAL FROM TEXT ─────────────────────────────────────────────────
 export async function extractDenialFromText(rawText: string): Promise<Partial<DenialRecord>> {
   const prompt = `Extract structured data from this prior authorization denial notice. Return ONLY valid JSON, no prose.
 
@@ -247,4 +277,196 @@ Return JSON with exactly these fields (use null for missing):
   } catch {
     return {};
   }
+}
+
+// ─── GENERATE P2P BRIEF ───────────────────────────────────────────────────────
+export interface P2PBrief {
+  openingStatement: string;
+  talkingPoints: string[];
+  anticipatedObjections: Array<{ objection: string; rebuttal: string }>;
+  keyCitations: string[];
+}
+
+export async function generateP2PBrief(
+  appeal: AppealPacket,
+  denial: DenialRecord,
+  patient: PatientProfile,
+  gt: GroundTruth
+): Promise<P2PBrief> {
+  const drug = storage.getDrug(gt.drugId);
+  const nccn = Array.from(storage.getAllNccn()).find(n => n.nccnId === gt.nccnId);
+  const statute = BAD_FAITH_STATUTES[patient.state] || BAD_FAITH_STATUTES["DEFAULT"];
+  const biomarkers = JSON.parse(patient.biomarkers || "{}");
+
+  // Biomarker-aware citations
+  const biomarkerCitations: string[] = [];
+  for (const [key, value] of Object.entries(biomarkers)) {
+    const citationKey = key.toUpperCase();
+    if (BIOMARKER_CITATIONS[citationKey]) biomarkerCitations.push(BIOMARKER_CITATIONS[citationKey]);
+    if (key === "HER2" && String(value).toLowerCase().includes("low")) biomarkerCitations.push(BIOMARKER_CITATIONS["HER2_low"]);
+  }
+
+  const prompt = `You are a senior oncologist preparing for a peer-to-peer (P2P) call with a payer medical director to appeal a prior authorization denial.
+
+CASE:
+- Drug: ${denial.drugNameRaw}
+- Patient: ${patient.stage} ${patient.cancerType} cancer
+- Biomarkers: ${JSON.stringify(biomarkers)}
+- Denial reason: ${denial.denialReasonCode.replace(/_/g, " ")} — "${denial.denialReasonText}"
+- Payer: ${denial.payerName}
+- NCCN: ${nccn?.guidelineVersion} Category ${gt.nccnCategory} — ${nccn?.fullCitationText}
+- FDA: ${drug?.fdaApprovalStatus} — ${drug?.fdaLabelSummary}
+- Conflict: Type ${gt.conflictType} — ${gt.conflictDescription}
+- Biomarker trial evidence: ${biomarkerCitations.join("; ") || "Standard clinical evidence"}
+- State law: ${statute}
+
+Return ONLY valid JSON:
+{
+  "openingStatement": "1-2 sentence professional opening for the P2P call",
+  "talkingPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
+  "anticipatedObjections": [
+    {"objection": "likely payer objection", "rebuttal": "your response"},
+    {"objection": "second objection", "rebuttal": "your response"},
+    {"objection": "third objection", "rebuttal": "your response"}
+  ],
+  "keyCitations": ["citation 1", "citation 2", "citation 3"]
+}`;
+
+  try {
+    const response = await cohere.chat({
+      model: "command-a-03-2025",
+      message: prompt,
+      temperature: 0.3,
+      maxTokens: 1500,
+    });
+    const raw = response.text?.trim() || "{}";
+    const jsonStr = raw.replace(/^```json?\n?/, "").replace(/\n?```$/, "").trim();
+    return JSON.parse(jsonStr);
+  } catch {
+    // Fallback P2P brief
+    return {
+      openingStatement: `Thank you for taking the time to discuss this case. I am appealing the prior authorization denial for ${denial.drugNameRaw} for my patient with ${patient.stage} ${patient.cancerType} cancer, as the denial contradicts ${nccn?.guidelineVersion} Category ${gt.nccnCategory} guidelines and FDA approval.`,
+      talkingPoints: [
+        `Patient has ${Object.entries(biomarkers).map(([k,v]) => `${k}: ${v}`).join(", ")}, for which ${nccn?.guidelineVersion} Category ${gt.nccnCategory} guidelines recommend ${denial.drugNameRaw} as preferred therapy.`,
+        `${drug?.fdaLabelSummary}`,
+        `${gt.conflictDescription}`,
+        biomarkerCitations[0] || `Clinical evidence strongly supports ${denial.drugNameRaw} for this patient population.`,
+        `Denial of this therapy risks disease progression and may constitute bad-faith delay under ${statute}.`,
+      ],
+      anticipatedObjections: [
+        { objection: "Step therapy requirements not met.", rebuttal: `NCCN Category ${gt.nccnCategory} designates ${denial.drugNameRaw} as the preferred therapy for this indication. Requiring inferior prior therapy contradicts the evidence-based treatment sequence.` },
+        { objection: "Not medically necessary for this indication.", rebuttal: `FDA has approved ${drug?.brandName} specifically for this patient population (${drug?.fdaLabelReference}). FDA approval creates a presumption of medical necessity that the payer cannot override with internal criteria.` },
+        { objection: "Classified as experimental/investigational.", rebuttal: `${drug?.brandName} received FDA approval based on Phase III trial data. NCCN Category ${gt.nccnCategory} classification reflects the highest level of clinical evidence. Experimental classification is factually incorrect.` },
+      ],
+      keyCitations: [
+        `${nccn?.guidelineVersion} — ${nccn?.pageReference} (Category ${gt.nccnCategory})`,
+        `FDA approval: ${drug?.fdaLabelReference} — ${drug?.fdaLabelSummary?.slice(0, 150)}`,
+        biomarkerCitations[0] || `Clinical trial evidence supporting ${denial.drugNameRaw} in this population.`,
+      ],
+    };
+  }
+}
+
+// ─── PREDICTIVE DENIAL SCORING ────────────────────────────────────────────────
+export interface DenialScore {
+  score: number;           // 0-100
+  breakdown: {
+    nccnCategory: number;
+    conflictType: number;
+    biomarkerMatch: number;
+    historicalWinRate: number;
+    priorTherapyDoc: number;
+  };
+  recommendation: string;
+  estimatedWinRate: number;
+  appealStrengthLabel: string;
+}
+
+export async function scoreDenialPredictively(
+  denial: DenialRecord,
+  patient: PatientProfile
+): Promise<DenialScore> {
+  const gt = await matchDenialToGroundTruth(denial, patient);
+
+  let nccnScore = 0;
+  let conflictScore = 0;
+  let biomarkerScore = 0;
+  let historicalScore = 0;
+  let priorTherapyScore = 0;
+
+  if (gt) {
+    // NCCN category score
+    if (gt.nccnCategory === "1") nccnScore = 30;
+    else if (gt.nccnCategory === "2A") nccnScore = 20;
+    else if (gt.nccnCategory === "2B") nccnScore = 10;
+    else nccnScore = 5;
+
+    // Conflict type score
+    if (gt.conflictType === "A") conflictScore = 25;
+    else if (gt.conflictType === "B") conflictScore = 20;
+    else if (gt.conflictType === "C") conflictScore = 15;
+    else conflictScore = 10;
+
+    // Biomarker match score
+    try {
+      const patientBiomarkers = JSON.parse(patient.biomarkers || "{}");
+      const gtBiomarkers = JSON.parse(gt.biomarkerProfile || "{}");
+      const patientKeys = Object.keys(patientBiomarkers);
+      const gtKeys = Object.keys(gtBiomarkers);
+      const matchCount = patientKeys.filter(k => gtKeys.includes(k)).length;
+      biomarkerScore = gtKeys.length > 0 ? Math.round((matchCount / gtKeys.length) * 20) : 10;
+    } catch {
+      biomarkerScore = 10;
+    }
+  } else {
+    nccnScore = 10;
+    conflictScore = 10;
+    biomarkerScore = 5;
+  }
+
+  // Historical win rate (from outcome data)
+  const winRateStats = storage.getWinRateStats(denial.organizationId);
+  const payerWinRate = winRateStats.byPayer[denial.payerId];
+  if (payerWinRate !== undefined) {
+    historicalScore = Math.round(payerWinRate * 0.15); // max 15 points
+  } else {
+    historicalScore = 8; // default moderate
+  }
+
+  // Prior therapy documentation score
+  try {
+    const priorTherapies = JSON.parse(patient.priorTherapies || "[]");
+    if (priorTherapies.length >= 2) priorTherapyScore = 15;
+    else if (priorTherapies.length === 1) priorTherapyScore = 10;
+    else priorTherapyScore = 5;
+  } catch {
+    priorTherapyScore = 5;
+  }
+
+  const score = Math.min(100, nccnScore + conflictScore + biomarkerScore + historicalScore + priorTherapyScore);
+  const estimatedWinRate = Math.min(95, Math.round(score * 0.85));
+
+  let recommendation: string;
+  let appealStrengthLabel: string;
+  if (score >= 75) {
+    recommendation = "Submit expedited appeal immediately. High probability of reversal with proper documentation.";
+    appealStrengthLabel = "VERY HIGH — near-certain reversal";
+  } else if (score >= 55) {
+    recommendation = "Submit standard appeal with full documentation package. Strong clinical and legal basis.";
+    appealStrengthLabel = "HIGH — strong legal and clinical basis";
+  } else if (score >= 35) {
+    recommendation = "Submit appeal with additional supporting documentation. Consider requesting P2P review.";
+    appealStrengthLabel = "MODERATE — merits appeal with documentation";
+  } else {
+    recommendation = "Escalate directly to external independent review. Consider state insurance commissioner complaint.";
+    appealStrengthLabel = "FAIR — escalate to external review";
+  }
+
+  return {
+    score,
+    breakdown: { nccnCategory: nccnScore, conflictType: conflictScore, biomarkerMatch: biomarkerScore, historicalWinRate: historicalScore, priorTherapyDoc: priorTherapyScore },
+    recommendation,
+    estimatedWinRate,
+    appealStrengthLabel,
+  };
 }
